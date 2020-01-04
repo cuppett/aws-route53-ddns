@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DDNS Route53 service — direct API Gateway→Route53 AWS service proxy with
+  TOKEN-type Lambda authorizer. Zone ID is a path parameter so a single
+  deployment can serve any hosted zone without stack updates.
+
+Parameters:
+  AuthorizationParameterName:
+    Type: String
+    Default: DDNS_ROUTE53_AUTHORIZATION
+    Description: >
+      Name of the SSM SecureString parameter that holds the shared
+      authorization token. Any client presenting this exact string in the
+      Authorization header is permitted to update DNS records.
+
+  RecordTtl:
+    Type: Number
+    Default: 60
+    Description: TTL in seconds for Route53 A records.
+
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway stage name.
+
+  LogRetention:
+    Type: Number
+    Default: 14
+    Description: CloudWatch log retention in days for the authorizer Lambda.
+
+Resources:
+
+  # ── IAM ────────────────────────────────────────────────────────────────────
+
+  ApiGatewayRoute53Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows API Gateway to call Route53 ChangeResourceRecordSets on my behalf
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Route53UpdatePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                # The zone is further constrained by the path parameter in the
+                # integration URI — the token authorizer is the access gate.
+                Resource: "arn:aws:route53:::hostedzone/*"
+
+  AuthorizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allows Lambda function to read the authorization parameter
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadDDNSParameter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AuthorizationParameterName}"
+
+  # ── Lambda authorizer ──────────────────────────────────────────────────────
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/AuthorizeDDNS
+      RetentionInDays: !Ref LogRetention
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AuthorizerLogGroup
+    Properties:
+      FunctionName: AuthorizeDDNS
+      Description: TOKEN-type authorizer — checks Authorization header against SSM SecureString
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerLambdaRole.Arn
+      MemorySize: 128
+      Timeout: 3
+      Environment:
+        Variables:
+          PARAMETER_NAME: !Ref AuthorizationParameterName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              ssm_client = boto3.client('ssm')
+              auth_token = ssm_client.get_parameter(
+                  Name=os.environ['PARAMETER_NAME'], WithDecryption=True)
+
+              return {
+                  'principalId': 'user',
+                  'policyDocument': {
+                      'Version': '2012-10-17',
+                      'Statement': [{
+                          'Action': 'execute-api:Invoke',
+                          'Effect': 'Allow' if auth_token['Parameter']['Value'] == event['authorizationToken'] else 'Deny',
+                          'Resource': '*'
+                      }]
+                  }
+              }
+
+  AuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AuthorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DDNSApi}/authorizers/*"
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+
+  DDNSApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ddns
+      Description: Dynamic DNS update
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Path structure: /{zone_id}/nic/update
+  # The caller passes the Route53 hosted zone ID as a path segment so a single
+  # deployment can update records in any zone without stack changes.
+  ZoneIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !GetAtt DDNSApi.RootResourceId
+      PathPart: "{zone_id}"
+
+  NicResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !Ref ZoneIdResource
+      PathPart: nic
+
+  UpdateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !Ref NicResource
+      PathPart: update
+
+  DDNSAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: AllowOnMatch
+      RestApiId: !Ref DDNSApi
+      Type: TOKEN
+      IdentitySource: method.request.header.Authorization
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations"
+      # TTL=0: the original deployed with no caching on the authorizer result.
+      AuthorizerResultTtlInSeconds: 0
+
+  UpdateGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ResourceId: !Ref UpdateResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref DDNSAuthorizer
+      RequestParameters:
+        method.request.path.zone_id: true
+        method.request.querystring.hostname: true
+        method.request.querystring.myip: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseModels:
+            text/plain: Empty
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        # The zone_id path parameter is forwarded to the Route53 API URI so
+        # the caller controls which hosted zone to update.
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:route53:path/2013-04-01/hostedzone/{hosted_zone_id}/rrset/"
+        Credentials: !GetAtt ApiGatewayRoute53Role.Arn
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/xml'"
+          integration.request.path.hosted_zone_id: method.request.path.zone_id
+        RequestTemplates:
+          application/json: !Sub |
+            <ChangeResourceRecordSetsRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">
+                <ChangeBatch>
+                    <Changes>
+                        <Change>
+                            <Action>UPSERT</Action>
+                            <ResourceRecordSet>
+                                <Name>$input.params('hostname')</Name>
+                                <Type>A</Type>
+                                <TTL>${RecordTtl}</TTL>
+                                <ResourceRecords>
+                                    <ResourceRecord>
+                                        <Value>$input.params('myip')</Value>
+                                    </ResourceRecord>
+                                </ResourceRecords>
+                            </ResourceRecordSet>
+                        </Change>
+                    </Changes>
+                </ChangeBatch>
+            </ChangeResourceRecordSetsRequest>
+        IntegrationResponses:
+          - StatusCode: "200"
+            SelectionPattern: ""
+            ResponseTemplates:
+              application/json: "good"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: UpdateGetMethod
+    Properties:
+      RestApiId: !Ref DDNSApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DDNSApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway base URL
+    Value: !Sub "https://${DDNSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  UpdateUrl:
+    Description: DNS update endpoint (replace ZONE_ID with your Route53 hosted zone ID)
+    Value: !Sub "https://${DDNSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/{ZONE_ID}/nic/update"
