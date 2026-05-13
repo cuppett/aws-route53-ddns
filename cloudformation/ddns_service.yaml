@@ -1,0 +1,436 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: DDNS Route53 service — DynDNS2-compatible dynamic DNS using Lambda, API Gateway, and DynamoDB
+
+Parameters:
+  ImageUri:
+    Description: Full ECR image URI including tag (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/ddns-route53:latest)
+    Type: String
+
+  TableName:
+    Description: DynamoDB table name for DDNS authorization records
+    Type: String
+    Default: DDNSAuthorization
+
+  AuthCacheTtl:
+    Description: Authorizer result cache TTL in seconds (0 = disable caching)
+    Type: Number
+    Default: 300
+    MinValue: 0
+    MaxValue: 3600
+
+  RecordTtl:
+    Description: Route53 A record TTL in seconds
+    Type: Number
+    Default: 60
+
+  LambdaMemory:
+    Description: Lambda function memory in MB
+    Type: Number
+    Default: 256
+
+  LambdaTimeout:
+    Description: Lambda function timeout in seconds
+    Type: Number
+    Default: 30
+
+  LogRetention:
+    Description: CloudWatch log retention in days
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+
+  StageName:
+    Description: API Gateway stage name
+    Type: String
+    Default: v1
+
+  CustomDomainName:
+    Description: "(Optional) Custom domain name for the API (e.g. ddns.cuppett.com). Leave blank to use the default execute-api URL."
+    Type: String
+    Default: ""
+
+  CertificateArn:
+    Description: "(Optional) ACM certificate ARN for the custom domain. Required when CustomDomainName is set."
+    Type: String
+    Default: ""
+
+  HostedZoneIdForDomain:
+    Description: "(Optional) Route53 hosted zone ID for creating the custom domain alias record. Required when CustomDomainName is set."
+    Type: String
+    Default: ""
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Container Image
+        Parameters: [ImageUri]
+      - Label:
+          default: Service Configuration
+        Parameters: [TableName, RecordTtl, StageName]
+      - Label:
+          default: Lambda Configuration
+        Parameters: [LambdaMemory, LambdaTimeout, AuthCacheTtl, LogRetention]
+      - Label:
+          default: Custom Domain (Optional)
+        Parameters: [CustomDomainName, CertificateArn, HostedZoneIdForDomain]
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, ""]]
+
+Resources:
+
+  # ──────────────────────────── DynamoDB ────────────────────────────
+
+  AuthTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+
+  # ──────────────────────────── IAM Roles ────────────────────────────
+
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ddns-authorizer:*"
+        - PolicyName: DynamoDBRead
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt AuthTable.Arn
+
+  UpdateHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ddns-update-handler:*"
+        - PolicyName: Route53Update
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # Zone scoping is enforced by the DynamoDB allowed_hosts mapping (ADR 0005)
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListResourceRecordSets
+                Resource: "arn:aws:route53:::hostedzone/*"
+
+  CheckipRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ddns-checkip:*"
+
+  # ──────────────────────────── CloudWatch Log Groups ────────────────────────────
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ddns-authorizer
+      RetentionInDays: !Ref LogRetention
+
+  UpdateHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ddns-update-handler
+      RetentionInDays: !Ref LogRetention
+
+  CheckipLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ddns-checkip
+      RetentionInDays: !Ref LogRetention
+
+  # ──────────────────────────── Lambda Functions ────────────────────────────
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AuthorizerLogGroup
+    Properties:
+      FunctionName: ddns-authorizer
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["src.authorizer.handler"]
+      Role: !GetAtt AuthorizerRole.Arn
+      Architectures: [arm64]
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+
+  UpdateHandlerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: UpdateHandlerLogGroup
+    Properties:
+      FunctionName: ddns-update-handler
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["src.update_handler.handler"]
+      Role: !GetAtt UpdateHandlerRole.Arn
+      Architectures: [arm64]
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          RECORD_TTL: !Ref RecordTtl
+
+  CheckipFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CheckipLogGroup
+    Properties:
+      FunctionName: ddns-checkip
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command: ["src.checkip_handler.handler"]
+      Role: !GetAtt CheckipRole.Arn
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 10
+
+  # ──────────────────────────── API Gateway ────────────────────────────
+
+  DDNSApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ddns
+      Description: DynDNS2-compatible Dynamic DNS update API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # /nic
+  NicResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !GetAtt DDNSApi.RootResourceId
+      PathPart: nic
+
+  # /nic/update
+  UpdateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !Ref NicResource
+      PathPart: update
+
+  # /checkip
+  CheckipResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ParentId: !GetAtt DDNSApi.RootResourceId
+      PathPart: checkip
+
+  DDNSAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: DDNSBasicAuth
+      RestApiId: !Ref DDNSApi
+      Type: REQUEST
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: !Ref AuthCacheTtl
+      AuthorizerUri: !Sub
+        - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations"
+        - Arn: !GetAtt AuthorizerFunction.Arn
+
+  UpdateGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ResourceId: !Ref UpdateResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref DDNSAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations"
+          - Arn: !GetAtt UpdateHandlerFunction.Arn
+
+  CheckipGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ResourceId: !Ref CheckipResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Arn}/invocations"
+          - Arn: !GetAtt CheckipFunction.Arn
+
+  # Override 401/403 responses to return 200 with "badauth" for DynDNS2 protocol compliance
+  UnauthorizedResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ResponseType: UNAUTHORIZED
+      StatusCode: "200"
+      ResponseParameters:
+        gatewayresponse.header.Content-Type: "'text/plain'"
+      ResponseTemplates:
+        text/plain: "badauth"
+        application/json: "badauth"
+
+  AccessDeniedResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref DDNSApi
+      ResponseType: ACCESS_DENIED
+      StatusCode: "200"
+      ResponseParameters:
+        gatewayresponse.header.Content-Type: "'text/plain'"
+      ResponseTemplates:
+        text/plain: "badauth"
+        application/json: "badauth"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UpdateGetMethod
+      - CheckipGetMethod
+    Properties:
+      RestApiId: !Ref DDNSApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref DDNSApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+
+  # ──────────────────────────── Lambda Invoke Permissions ────────────────────────────
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AuthorizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DDNSApi}/authorizers/${DDNSAuthorizer}"
+
+  UpdateHandlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UpdateHandlerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DDNSApi}/${StageName}/GET/nic/update"
+
+  CheckipInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CheckipFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${DDNSApi}/${StageName}/GET/checkip"
+
+  # ──────────────────────────── Custom Domain (Optional) ────────────────────────────
+
+  ApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      RegionalCertificateArn: !Ref CertificateArn
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasCustomDomain
+    DependsOn: ApiStage
+    Properties:
+      DomainName: !Ref ApiDomainName
+      RestApiId: !Ref DDNSApi
+      Stage: !Ref StageName
+
+  CustomDomainDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneIdForDomain
+      Name: !Ref CustomDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway base URL
+    Value: !Sub "https://${DDNSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  UpdateUrl:
+    Description: DynDNS2 update endpoint
+    Value: !Sub "https://${DDNSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/nic/update"
+
+  CheckipUrl:
+    Description: CheckIP endpoint (returns caller's public IP)
+    Value: !Sub "https://${DDNSApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/checkip"
+
+  TableName:
+    Description: DynamoDB authorization table name
+    Value: !Ref TableName
+
+  CustomDomainUrl:
+    Condition: HasCustomDomain
+    Description: Custom domain update endpoint
+    Value: !Sub "https://${CustomDomainName}/nic/update"

@@ -1,0 +1,5 @@
+pytest
+moto[dynamodb,route53]
+bcrypt
+boto3
+botocore
