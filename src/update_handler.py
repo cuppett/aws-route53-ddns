@@ -5,7 +5,11 @@ import os
 from src.dns_utils import get_current_record, upsert_record
 from src.validators import validate_fqdn, validate_ipv4
 
-logging.getLogger().setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+_log_level = os.environ.get('LOG_LEVEL', 'INFO')
+_root = logging.getLogger()
+_root.setLevel(_log_level)
+for _h in _root.handlers:
+    _h.setLevel(_log_level)
 logger = logging.getLogger(__name__)
 
 RECORD_TTL = int(os.environ.get('RECORD_TTL', '60'))
