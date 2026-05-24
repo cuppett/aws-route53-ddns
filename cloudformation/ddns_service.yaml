@@ -65,6 +65,19 @@ Parameters:
     Type: String
     Default: ""
 
+  SecurityPolicy:
+    Description: >
+      TLS security policy for the custom domain name.
+      SecurityPolicy_TLS13_1_2_2021_06: TLS 1.2+ with TLS 1.3 support (recommended).
+      SecurityPolicy_TLS13_1_3_2025_09: TLS 1.3 only — rejects TLS 1.2 clients.
+      TLS_1_0: Legacy — allows TLS 1.0, 1.1, 1.2 (not recommended for new deployments).
+    Type: String
+    Default: SecurityPolicy_TLS13_1_2_2021_06
+    AllowedValues:
+      - SecurityPolicy_TLS13_1_2_2021_06
+      - SecurityPolicy_TLS13_1_3_2025_09
+      - TLS_1_0
+
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -79,10 +92,11 @@ Metadata:
         Parameters: [LambdaMemory, LambdaTimeout, AuthCacheTtl, LogRetention]
       - Label:
           default: Custom Domain (Optional)
-        Parameters: [CustomDomainName, CertificateArn, HostedZoneIdForDomain]
+        Parameters: [CustomDomainName, CertificateArn, HostedZoneIdForDomain, SecurityPolicy]
 
 Conditions:
   HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, ""]]
+  IsEnhancedPolicy: !Not [!Equals [!Ref SecurityPolicy, 'TLS_1_0']]
 
 Resources:
 
@@ -400,6 +414,8 @@ Resources:
       RegionalCertificateArn: !Ref CertificateArn
       EndpointConfiguration:
         Types: [REGIONAL]
+      SecurityPolicy: !Ref SecurityPolicy
+      EndpointAccessMode: !If [IsEnhancedPolicy, STRICT, !Ref 'AWS::NoValue']
 
   ApiBasePathMapping:
     Type: AWS::ApiGateway::BasePathMapping

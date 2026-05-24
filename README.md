@@ -119,28 +119,33 @@ curl "$API/checkip"
 
 ### ddclient
 
+ddclient 4.x (Fedora 44, current Debian/Ubuntu) uses `usev4=webv4` for IPv4 web-based IP detection. ddclient 3.x uses the deprecated `use=web` form (still functional in 4.x if you prefer backward compatibility).
+
 ```ini
-# /etc/ddclient.conf
+# /etc/ddclient.conf  (ddclient 4.x)
 protocol=dyndns2
 server=APIGW_ID.execute-api.us-east-1.amazonaws.com/v1
 ssl=yes
 login=mydevice
 password=a-strong-password
-use=web, web=APIGW_ID.execute-api.us-east-1.amazonaws.com/v1/checkip
+usev4=webv4, webv4=https://APIGW_ID.execute-api.us-east-1.amazonaws.com/v1/checkip, webv4-skip='Current IP Address: '
 test.example.com
 ```
 
 With a custom domain (`ddns.example.com`):
 
 ```ini
+# ddclient 4.x
 protocol=dyndns2
 server=ddns.example.com
 ssl=yes
 login=mydevice
 password=a-strong-password
-use=web, web=https://ddns.example.com/checkip, web-skip='Current IP Address: '
+usev4=webv4, webv4=https://ddns.example.com/checkip, webv4-skip='Current IP Address: '
 test.example.com
 ```
+
+For ddclient 3.x, replace `usev4=webv4, webv4=..., webv4-skip=` with `use=web, web=..., web-skip=`.
 
 ### ASUS Merlin (custom DDNS script)
 
