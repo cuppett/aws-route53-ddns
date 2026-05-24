@@ -23,6 +23,26 @@ Tests use `moto` to mock AWS services. No real AWS calls during unit tests.
 podman build -t ddns-route53:latest -f Containerfile .
 ```
 
+## Deploying
+
+The Makefile defaults (`ACCOUNT_ID=123456789012`, `PROFILE=default`) are intentionally generic placeholders. Always supply the real values:
+
+```bash
+make push PROFILE=<profile> ACCOUNT_ID=<account-id>
+make deploy-service PROFILE=<profile> ACCOUNT_ID=<account-id>
+```
+
+**Image-only changes are invisible to CloudFormation** when using a fixed `latest` tag — the stack sees the same `ImageUri` parameter and reports "no changes". After `make push`, force the Lambdas to pull the new image:
+
+```bash
+aws lambda update-function-code --function-name ddns-authorizer \
+  --image-uri <account-id>.dkr.ecr.us-east-1.amazonaws.com/ddns-route53:latest \
+  --profile <profile> --region us-east-1
+aws lambda update-function-code --function-name ddns-update-handler \
+  --image-uri <account-id>.dkr.ecr.us-east-1.amazonaws.com/ddns-route53:latest \
+  --profile <profile> --region us-east-1
+```
+
 ## Key Files
 
 | File | Purpose |
