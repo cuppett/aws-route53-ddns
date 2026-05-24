@@ -6,7 +6,11 @@ import os
 import bcrypt
 import boto3
 
-logging.getLogger().setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+_log_level = os.environ.get('LOG_LEVEL', 'INFO')
+_root = logging.getLogger()
+_root.setLevel(_log_level)
+for _h in _root.handlers:
+    _h.setLevel(_log_level)
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = os.environ.get('TABLE_NAME', 'DDNSAuthorization')
