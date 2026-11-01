@@ -1,4 +1,4 @@
-FROM public.ecr.aws/lambda/python:3.13
+FROM public.ecr.aws/lambda/python:3.14
 
 ENV SUMMARY="DynDNS2-compatible DDNS service running on AWS Lambda with Route53 backend." \
     DESCRIPTION="DynDNS2-compatible DDNS service running on AWS Lambda with Route53 backend." \
